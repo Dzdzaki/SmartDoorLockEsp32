@@ -1,98 +1,186 @@
-#include <MFRC522.h> // Untuk RFID
-#include <SPI.h>     // Untuk komunikasi SPI dengan RFID
-#include <LiquidCrystal_I2C.h> // Untuk LCD I2C
-#include <ESP32Servo.h>  // Untuk Servo (pastikan Anda menginstal library ini untuk ESP32)
+// --- PUSTAKA/LIBRARY ---
+#include <WiFi.h>
+#include <MFRC522.h>
+#include <SPI.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <Firebase_ESP_Client.h>
 
-// Definisikan pin-pin hardware
-#define SS_PIN      5 // SDA pin for RFID (GPIO5) ungu // MOSI: GPIO 23 cokelat// MISO: GPIO 19 kuing
-#define RST_PIN     4 // RST pin for RFID (GPIO4) putih
-#define BUZZER_PIN  33 // GPIO33 putih
-#define LED_PIN     32 // GPIO32 putih 
-#define ECHO_PIN    27 // GPIO12 hijau
-#define TRIG_PIN    14 // GPIO14 kuning
-#define SERVO_PIN   13 // GPIO13 kuning
+// --- PENGATURAN JARINGAN ---
+const char* ssid = "Infinix11";
+const char* password = "12345678";
 
+// --- PENGATURAN FIREBASE (WAJIB DIISI) ---
+#define API_KEY 
+#define FIREBASE_PROJECT_ID 
+#define USER_EMAIL 
+#define USER_PASSWORD 
+#define DATABASE_URL 
+// --- INISIALISASI OBJEK FIREBASE ---
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
 
+// --- DEFINISI PIN HARDWARE ---
+#define SS_PIN      5
+#define RST_PIN     4
+#define BUZZER_PIN  33
+#define LED_PIN     32
+#define ECHO_PIN    27
+#define TRIG_PIN    14
+#define SERVO_PIN   13
 
-// Inisialisasi objek
+// --- INISIALISASI OBJEK HARDWARE ---
 MFRC522 rfid(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Alamat I2C LCD (sesuaikan jika berbeda, umum 0x27 atau 0x3F), 16 kolom, 2 baris
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 Servo myServo;
 
-// Variabel global
+// --- VARIABEL GLOBAL ---
 unsigned long lastMovementTime = 0;
-const long LED_TIMEOUT = 1000; // 1 menit dalam milidetik (60 * 1000)
-bool isDoorLocked = true; // Status kunci pintu
+unsigned long doorOpenedTime = 0;
+const long LED_TIMEOUT = 10000;
+const long AUTOLOCK_TIMEOUT = 10000;
+bool isDoorLocked = true;
+String lastUserUnlockedUID = "";
+String lastUserUnlockedName = "";
 
-// Array untuk UID yang diizinkan dan nama pengguna
-String authorizedUIDs[] = {
-  "695CB101", // UID Kartu 1
-  "D709C905", // UID Kartu 2
-  "436C3916", // UID Kartu 3
-  "CAEF2F03"  // UID Kartu 4
+// --- POSISI SUDUT SERVO ---
+const int lockedPosition = 0;
+const int unlockedPosition = 90;
+
+// --- FUNGSI UNTUK MENGIRIM LOG KE REALTIME DATABASE ---
+void sendLogToRTDB(String status, String action, String user, String reason, String uid) {
+  if (Firebase.ready()) {
+    String path = "/access_logs"; // Path utama untuk semua log
+    
+    FirebaseJson content;
+    content.set("status", status);
+    // content.set("log_time", ".sv", "timestamp"); // <-- BARIS INI DIHAPUS
+    if (action != "") content.set("action", action);
+    if (user != "") content.set("user", user);
+    if (reason != "") content.set("reason", reason);
+    if (uid != "") content.set("uid", uid);
+
+    // pushJSON akan membuat ID unik untuk setiap log baru
+    if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &content)) {
+      Serial.println("Log berhasil dikirim ke Realtime Database.");
+    } else {
+      Serial.println("Gagal mengirim log: " + fbdo.errorReason());
+    }
+  }
+}
+
+// --- FUNGSI VERIFIKASI PENGGUNA DARI REALTIME DATABASE ---
+bool verifyUserFromRTDB(String rfidUID, String &userName) {
+  if (!Firebase.ready()) {
+    Serial.println("Firebase belum siap, verifikasi dibatalkan.");
+    return false;
+  }
+
+  String path = "/auth_users/" + rfidUID + "/name";
+  Serial.println("Mengecek UID ke RTDB: " + path);
   
-};
-String userNames[] = {
-  "Kelas Tcg2a",
-  "Kelas Tcg1b",
-  "Kelas Tcg2b",
-  "Kelas Tcg1a"
-};
+  if (Firebase.RTDB.getString(&fbdo, path.c_str())) {
+    if (fbdo.dataType() == "string") {
+      userName = fbdo.stringData();
+      Serial.println("Nama Pengguna: " + userName);
+      return true; 
+    }
+  }
+  
+  Serial.println("Pengguna tidak ditemukan atau terjadi error.");
+  Serial.println("ALASAN: " + fbdo.errorReason());
+  userName = "Unknown Card";
+  return false;
+}
 
-// Menghitung jumlah elemen dalam array secara dinamis
-int numberOfUIDs = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
 
-// Posisi servo
-const int lockedPosition = 0;   // Sudut untuk mengunci pintu
-const int unlockedPosition = 90; // Sudut untuk membuka pintu (sesuaikan)
-// --- Fungsi Debug Servo ---
-void servoDebug() {
-  Serial.println("\n--- Starting Servo Debug Test ---");
+// --- FUNGSI UNTUK KONEKSI WIFI ---
+void setup_wifi() {
+  delay(10);
+  Serial.println("\n");
+  Serial.print("Menghubungkan ke WiFi: ");
+  Serial.println(ssid);
+
   lcd.clear();
-  lcd.print("Servo Test...");
-  lcd.setCursor(0, 1);
-  lcd.print("Locked Pos");
+  lcd.print("Connecting to");
+  lcd.setCursor(0,1);
+  lcd.print("WiFi...");
 
-  myServo.write(lockedPosition); // Posisikan servo ke posisi terkunci
-  delay(1500); // Tunggu sebentar
+  WiFi.begin(ssid, password);
 
-  Serial.println("Servo moving to Unlocked Position...");
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if(retries++ > 20) {
+        Serial.println("\nFailed to connect to WiFi!");
+        lcd.clear();
+        lcd.print("WiFi Failed!");
+        delay(2000);
+        return;
+    }
+  }
+
+  Serial.println("\nWiFi terhubung!");
+  Serial.print("Alamat IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --- FUNGSI AUTO LOCK ---
+void autoLockDoor() {
+  myServo.write(lockedPosition);
+  isDoorLocked = true;
+  digitalWrite(LED_PIN, LOW);
+  lastMovementTime = 0;
+  doorOpenedTime = 0;
+  lastUserUnlockedUID = "";
+  lastUserUnlockedName = "";
+
+  Serial.println("No movement. Auto-lock activated.");
   lcd.clear();
-  lcd.print("Servo Test...");
+  lcd.print("No Movement...");
   lcd.setCursor(0, 1);
-  lcd.print("Unlocked Pos");
+  lcd.print("Auto-Locked");
+  delay(2000);
 
-  myServo.write(unlockedPosition); // Posisikan servo ke posisi terbuka
-  delay(1500); // Tunggu sebentar
+  sendLogToRTDB("AutoLocked", "Locked", "", "No movement", "");
 
-  Serial.println("Servo moving back to Locked Position...");
-  lcd.clear();
-  lcd.print("Servo Test...");
-  lcd.setCursor(0, 1);
-  lcd.print("Locked Pos");
-
-  myServo.write(lockedPosition); // Posisikan servo kembali ke terkunci
-  delay(1500); // Tunggu sebentar
-
-  Serial.println("--- Servo Debug Test Complete ---");
   lcd.clear();
   lcd.print("Smart Door Lock");
   lcd.setCursor(0, 1);
-  lcd.print("Ready.");
-  delay(1000); // Beri waktu untuk pesan "Ready"
+  lcd.print("Locked");
 }
 
+// --- SETUP ---
 void setup() {
   Serial.begin(115200);
-  SPI.begin();       // Inisialisasi SPI bus
-  rfid.PCD_Init();   // Inisialisasi modul MFRC522
+  SPI.begin();
+  rfid.PCD_Init();
 
-  lcd.init();        // Inisialisasi LCD
-  lcd.backlight();   // Nyalakan backlight LCD
+  lcd.init();
+  lcd.backlight();
   lcd.print("Smart Door Lock");
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
-  delay(1000); // Beri waktu untuk LCD menampilkan pesan
+  delay(1000);
+
+  setup_wifi();
+
+  lcd.clear();
+  lcd.print("Connecting to");
+  lcd.setCursor(0,1);
+  lcd.print("Firebase...");
+
+  // --- Konfigurasi Firebase untuk Realtime Database ---
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = nullptr;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -100,123 +188,129 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
 
   myServo.attach(SERVO_PIN);
-  myServo.write(lockedPosition); // Pastikan servo di posisi terkunci di awal
-  digitalWrite(LED_PIN, LOW);    // Pastikan LED mati di awal
-
+  myServo.write(lockedPosition);
+  digitalWrite(LED_PIN, LOW);
+  
   lcd.clear();
   lcd.print("Smart Door Lock");
   lcd.setCursor(0, 1);
-  lcd.print("Locked"); // Tampilkan status awal pintu
+  lcd.print("Locked");
+  
+  sendLogToRTDB("Online", "System Boot", "", "", "");
 }
 
+// --- LOOP UTAMA ---
 void loop() {
-  // --- RFID Reader ---
+  // --- RFID ---
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     String rfidUID = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
-      rfidUID += String(rfid.uid.uidByte[i] < 0x10 ? "0" : ""); // Tambahkan '0' di depan jika nilai < 0x10
-      rfidUID += String(rfid.uid.uidByte[i], HEX);              // Konversi byte ke heksadesimal
+      rfidUID += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+      rfidUID += String(rfid.uid.uidByte[i], HEX);
     }
-    rfidUID.toUpperCase(); // Ubah ke huruf besar untuk konsistensi
-    Serial.print("RFID UID: ");
+    rfidUID.toUpperCase();
+    Serial.print("RFID UID Detected: ");
     Serial.println(rfidUID);
 
-    bool accessGranted = false;
-    String detectedUserName = "Unknown Card"; // Default nama jika tidak ditemukan
-
-    // Cek apakah UID yang dibaca ada dalam daftar yang diizinkan
-    for (int i = 0; i < numberOfUIDs; i++) {
-      if (rfidUID == authorizedUIDs[i]) {
-        accessGranted = true;
-        detectedUserName = userNames[i];
-        break; // Keluar dari loop setelah menemukan kecocokan
-      }
-    }
+    String detectedUserName;
+    bool accessGranted = verifyUserFromRTDB(rfidUID, detectedUserName);
 
     if (accessGranted) {
-      Serial.println("Access Granted!");
       lcd.clear();
-      lcd.print("Welcome,");
-      lcd.setCursor(0, 1);
-      lcd.print(detectedUserName); // Tampilkan nama pengguna yang terdeteksi
-      tone(BUZZER_PIN, 1000, 200); // Bunyi 'beep' untuk akses granted
-      delay(2000); // Tampilkan pesan selamat datang sebentar
+      tone(BUZZER_PIN, 1000, 200);
 
-      // Logika Buka/Kunci Pintu
       if (isDoorLocked) {
-        myServo.write(unlockedPosition); // Gerakkan servo untuk membuka kunci
-        delay(500); // Beri waktu servo untuk bergerak
+        myServo.write(unlockedPosition);
         isDoorLocked = false;
-        Serial.println("Door Unlocked.");
-      } else {
-        // Tapout - kunci pintu kembali
-        myServo.write(lockedPosition); // Gerakkan servo untuk mengunci
-        delay(500); // Beri waktu servo untuk bergerak
-        isDoorLocked = true;
-        digitalWrite(LED_PIN, LOW); // Matikan LED saat tapout/kunci
-        lastMovementTime = 0; // Reset timer pergerakan saat pintu terkunci
-        Serial.println("Door Locked.");
+        lastUserUnlockedUID = rfidUID;
+        lastUserUnlockedName = detectedUserName;
+        doorOpenedTime = millis();
 
-        lcd.clear();
-        lcd.print("Door Locked.");
+        Serial.println("Access Granted: Door Unlocked by " + detectedUserName);
+        lcd.print("Welcome,");
         lcd.setCursor(0, 1);
-        lcd.print("Goodbye!");
-        delay(1500);
+        lcd.print(detectedUserName);
+        delay(2000);
+
+        sendLogToRTDB("Granted", "Unlocked", detectedUserName, "", rfidUID);
+
+      } else {
+        if (rfidUID == lastUserUnlockedUID) {
+          myServo.write(lockedPosition);
+          isDoorLocked = true;
+          digitalWrite(LED_PIN, LOW);
+          lastMovementTime = 0;
+          doorOpenedTime = 0;
+          lastUserUnlockedUID = "";
+          lastUserUnlockedName = "";
+
+          Serial.println("Access Granted: Door Locked by " + detectedUserName);
+          lcd.print("Door Locked.");
+          lcd.setCursor(0, 1);
+          lcd.print("Goodbye!");
+          delay(1500);
+
+          sendLogToRTDB("Granted", "Locked", detectedUserName, "", rfidUID);
+        } else {
+          Serial.println("Access Denied! Not the last user (" + detectedUserName + ") to unlock.");
+          lcd.print("Access Denied!");
+          lcd.setCursor(0, 1);
+          lcd.print("Not last user");
+          tone(BUZZER_PIN, 500, 500);
+          delay(2000);
+          
+          sendLogToRTDB("Denied", "Lock Attempt", detectedUserName, "Not last user", rfidUID);
+        }
       }
     } else {
-      Serial.println("Access Denied!");
+      Serial.println("Access Denied! Unknown Card.");
       lcd.clear();
       lcd.print("Access Denied!");
       lcd.setCursor(0, 1);
       lcd.print("Unknown Card.");
-      tone(BUZZER_PIN, 500, 500); // Bunyi 'buzz' untuk akses denied
+      tone(BUZZER_PIN, 500, 500);
       delay(2000);
+
+      sendLogToRTDB("Denied", "Access Attempt", "Unknown", "Unknown Card", rfidUID);
     }
-    rfid.PICC_HaltA(); // Hentikan komunikasi dengan kartu
-    rfid.PCD_StopCrypto1(); // Hentikan enkripsi untuk kartu yang saat ini dipilih
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
 
     lcd.clear();
     lcd.print("Smart Door Lock");
     lcd.setCursor(0, 1);
-    lcd.print(isDoorLocked ? "Locked" : "Unlocked"); // Tampilkan status kunci terbaru
+    lcd.print(isDoorLocked ? "Locked" : "Unlocked");
   }
 
-  // --- Ultrasonic Sensor (Hanya aktif jika pintu TIDAK terkunci) ---
+  // --- Sensor Ultrasonik (tidak ada perubahan) ---
   if (!isDoorLocked) {
-    long duration, distance;
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    // pulseIn dengan timeout untuk mencegah blokir jika tidak ada echo
-    duration = pulseIn(ECHO_PIN, HIGH, 30000); // Timeout 30ms
-
-    // Hanya hitung jarak jika ada pulsa pantul yang terdeteksi (duration > 0)
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
     if (duration > 0) {
-      distance = duration * 0.034 / 2; // Hitung jarak dalam cm
-
-      Serial.print("Distance: ");
-      Serial.print(distance);
-      Serial.println(" cm");
-
-      // Deteksi pergerakan/keberadaan orang (misalnya, jika ada objek di bawah 150 cm)
-      // Sesuaikan ambang batas jarak ini sesuai dengan penempatan sensor dan area deteksi yang diinginkan.
-      if (distance > 2 && distance < 150) { // Minimal 2cm untuk menghindari noise, maksimal 150cm
-        if (digitalRead(LED_PIN) == LOW) { // Nyalakan LED hanya jika belum nyala
+      long distance = duration * 0.034 / 2;
+      if (distance > 2 && distance < 150) {
+        if (digitalRead(LED_PIN) == LOW) {
           digitalWrite(LED_PIN, HIGH);
           Serial.println("Movement detected! LED ON.");
         }
-        lastMovementTime = millis(); // Perbarui waktu terakhir pergerakan
+        lastMovementTime = millis();
       }
     }
 
-    // Cek timeout LED (hanya jika LED sedang nyala)
     if (digitalRead(LED_PIN) == HIGH && (millis() - lastMovementTime > LED_TIMEOUT)) {
       digitalWrite(LED_PIN, LOW);
-      Serial.println("No movement for 1 minute. LED OFF.");
+      Serial.println("No movement for 10 seconds. LED OFF.");
+    }
+
+    if ((millis() - doorOpenedTime > AUTOLOCK_TIMEOUT) && (millis() - lastMovementTime > AUTOLOCK_TIMEOUT)) {
+      autoLockDoor();
     }
   }
-  delay(50); // Small delay for general stability of the loop
+
+  delay(50);
 }
